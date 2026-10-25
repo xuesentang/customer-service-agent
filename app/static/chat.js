@@ -135,6 +135,9 @@ function addAssistantTurn() {
   feedback.className = "feedback";
   const actions = document.createElement("div");
   actions.className = "actions";
+  // 演示视图开着时,每轮挂一个可折叠的内部状态面板(决策流那一行的展开版)
+  const xrayPanel = xrayOn ? createXrayPanel() : null;
+  if (xrayPanel) col.insertBefore(xrayPanel, badges);
   meta.append(sources, feedback);
   col.append(badges, bubble, meta, actions);
   msg.append(avatar, col);
@@ -154,6 +157,8 @@ function addAssistantTurn() {
     citations: [],
     flow,
     flowNodes: [],
+    xray: xrayPanel,
+    xrayData: { intent: null, resolved: null, gate: null, citations: [], tools: [], done: null, error: null },
   };
 }
 
@@ -684,9 +689,148 @@ function renderFeedback(turn) {
   turn.feedback.appendChild(wrap);
 }
 
+/* ---------------------------------------------------------------- 演示视图 */
+
+// ?xray=1 打开,或点顶栏「演示视图」按钮(状态记 sessionStorage,刷新不丢):
+// 每轮回答下方多一个只读面板,把 SSE 里已经在飞的内部状态显示出来——意图与
+// 置信度、指代补全、置信度闸读数、召回证据及分数、工具调用、终态与 trace 名。
+// 默认关闭:普通用户看不到这个面板。数据全部来自既有事件,零额外请求。
+let xrayOn =
+  new URLSearchParams(location.search).get("xray") === "1" ||
+  sessionStorage.getItem("kefu_xray") === "1";
+
+function applyXray(on) {
+  document.body.classList.toggle("xray-on", on);
+  const btn = document.getElementById("xray-toggle");
+  if (btn) btn.setAttribute("aria-pressed", on ? "true" : "false");
+  try {
+    sessionStorage.setItem("kefu_xray", on ? "1" : "0");
+  } catch (err) {
+    /* 隐私模式禁存 sessionStorage 也不碍事,当场有效 */
+  }
+}
+
+function clip(text, max) {
+  const s = String(text || "");
+  return s.length > max ? s.slice(0, max) + "…" : s;
+}
+
+function traceName(done) {
+  return "chat:" + (done && done.conversation_id != null ? done.conversation_id : "?");
+}
+
+function createXrayPanel() {
+  const box = document.createElement("details");
+  box.className = "xray";
+  const summary = document.createElement("summary");
+  summary.textContent = "演示视图";
+  const grid = document.createElement("div");
+  grid.className = "xray-grid";
+  box.append(summary, grid);
+  return box;
+}
+
+function xraySummary(data) {
+  const parts = ["演示视图"];
+  if (data.intent) parts.push(`${data.intent.intent}/${data.intent.route}`);
+  if (data.intent && data.intent.confidence != null) {
+    parts.push("conf " + Number(data.intent.confidence).toFixed(2));
+  }
+  if (data.gate) parts.push(`闸 ${data.gate.passed ? "过" : "拦"} ${Number(data.gate.top_score).toFixed(2)}`);
+  if (data.done) parts.push("trace " + traceName(data.done));
+  return parts.join(" · ");
+}
+
+function renderXray(turn) {
+  const panel = turn.xray;
+  const data = turn.xrayData;
+  if (!panel) return;
+  panel.querySelector("summary").textContent = xraySummary(data);
+  const grid = panel.querySelector(".xray-grid");
+  grid.innerHTML = "";
+  const row = (key, text, cls) => {
+    const k = document.createElement("span");
+    k.className = "xray-k";
+    k.textContent = key;
+    const v = document.createElement("span");
+    v.className = "xray-v" + (cls ? " " + cls : "");
+    v.textContent = text;
+    v.title = String(text);
+    grid.append(k, v);
+  };
+  if (data.intent) {
+    const conf = data.intent.confidence != null ? `(置信度 ${Number(data.intent.confidence).toFixed(2)})` : "";
+    row("意图", `${data.intent.intent} → ${data.intent.route}${conf}`);
+  }
+  if (data.resolved && data.resolved.changed) {
+    const order = data.resolved.order_id ? ` · 订单 ${data.resolved.order_id}` : "";
+    row("补全", `"${clip(data.resolved.resolved, 60)}"${order}`);
+  }
+  if (data.gate) {
+    row(
+      "闸",
+      `${data.gate.passed ? "放过" : "拦下"} · top_score ${Number(data.gate.top_score).toFixed(3)} · ` +
+        `置信度 ${Number(data.gate.confidence).toFixed(2)}${data.gate.reason ? " · " + clip(data.gate.reason, 90) : ""}`,
+      data.gate.passed ? "good" : "bad"
+    );
+  }
+  data.citations.forEach((c) => {
+    row("证据", `[${c.n}] ${clip(c.section_path || c.question || "知识库", 40)} · ${Number(c.score).toFixed(3)}`);
+  });
+  data.tools.forEach((t) => {
+    const state = t.ok ? "成功" : t.ok === false ? "失败" : "调用中";
+    row("工具", `${t.name} · ${state}${t.summary ? " · " + clip(t.summary, 50) : ""}`, t.ok === false ? "bad" : t.ok ? "good" : "");
+  });
+  if (data.done) {
+    row("终态", `${data.done.finish_reason} · trace ${traceName(data.done)}(在 Langfuse 里搜这个名字)`);
+  }
+  if (data.error) row("错误", clip(data.error, 120), "bad");
+}
+
+function xrayCollect(event, data, turn) {
+  if (!xrayOn || !turn.xray) return;
+  const x = turn.xrayData;
+  switch (event) {
+    case "intent":
+      x.intent = data;
+      break;
+    case "resolved":
+      x.resolved = data;
+      break;
+    case "gate":
+      x.gate = data;
+      break;
+    case "citations":
+      x.citations = data.citations || [];
+      break;
+    case "tool_start":
+      x.tools.push({ name: data.name, id: data.tool_call_id, ok: null, summary: "" });
+      break;
+    case "tool_end": {
+      const t = x.tools.find((item) => item.id === data.tool_call_id);
+      if (t) {
+        t.ok = data.ok;
+        t.summary = data.summary || "";
+      }
+      break;
+    }
+    case "done":
+      x.done = data;
+      renderXray(turn);
+      break;
+    case "error":
+      x.error = data.message || data.code || "unknown";
+      renderXray(turn);
+      break;
+    default:
+      break;
+  }
+}
+
 /* ---------------------------------------------------------------- 事件 */
 
 function handleEvent(event, data, turn) {
+  xrayCollect(event, data, turn);
   switch (event) {
     case "node":
       if (data.phase === "exit") appendFlowNode(turn, data.node);
@@ -924,6 +1068,14 @@ sendBtn.addEventListener("click", send);
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.isComposing) send();
 });
+const xrayToggleBtn = document.getElementById("xray-toggle");
+applyXray(xrayOn);
+if (xrayToggleBtn) {
+  xrayToggleBtn.addEventListener("click", () => {
+    xrayOn = !xrayOn;
+    applyXray(xrayOn);
+  });
+}
 newChatBtn.addEventListener("click", () => {
   pendingNewConversation = true;
   conversationId = null;
