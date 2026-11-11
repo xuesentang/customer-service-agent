@@ -147,8 +147,12 @@ class ToolExecutor:
         self._session_factory = session_factory
         self._audit = bool(audit and session_factory is not None)
 
-    async def execute(self, tool_call: dict, *, confirmed: bool = True) -> ToolResult:
-        """执行一次调用。`confirmed=False` 只影响写操作,只读工具不受影响。"""
+    async def execute(self, tool_call: dict, *, confirmed: bool = False) -> ToolResult:
+        """执行一次调用。`confirmed=False` 只影响写操作,只读工具不受影响。
+
+        默认 False 是刻意的:写操作必须由调用方显式声明「用户已经确认过」,
+        省略参数等于没确认、直接拒——权限闸的默认状态只能是关。
+        """
         started = time.monotonic()
         name = tool_call.get("name", "")
         args = tool_call.get("args") or {}

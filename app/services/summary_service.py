@@ -117,22 +117,32 @@ async def run_summary(
             return {"ok": False, "reason": "empty"}
 
         tokens = estimate_tokens(content)
-        await conversation_summary_repo.add_summary(
-            session,
-            conversation_id,
-            seq=seq,
-            content=content,
-            from_msg_id=msgs[0].id,
-            to_msg_id=msgs[-1].id,
-            tokens=tokens,
-        )
-        # 边界追到层 1 起点:摘要覆盖到哪,层 1 就从那条之后起——两个锚点同步推进
-        await conversation_summary_repo.advance_anchors(
-            session,
-            conv,
-            summary_upto_msg_id=msgs[-1].id,
-            layer1_from_msg_id=msgs[-1].id + 1,
-        )
+        try:
+            # 摘要行与锚点推进是一个事务:分批提交会留下「梗概已落、锚点没动」,
+            # 下一轮会把同一段再压一遍——历史里多一段重复梗概,而且不会自愈。
+            await conversation_summary_repo.add_summary(
+                session,
+                conversation_id,
+                seq=seq,
+                content=content,
+                from_msg_id=msgs[0].id,
+                to_msg_id=msgs[-1].id,
+                tokens=tokens,
+                commit=False,
+            )
+            # 边界追到层 1 起点:摘要覆盖到哪,层 1 就从那条之后起——两个锚点同步推进
+            await conversation_summary_repo.advance_anchors(
+                session,
+                conv,
+                summary_upto_msg_id=msgs[-1].id,
+                layer1_from_msg_id=msgs[-1].id + 1,
+                commit=False,
+            )
+            await session.commit()
+        except Exception as exc:  # noqa: BLE001 - 摘要失败不影响主链路,但要整体回滚
+            await session.rollback()
+            logger.warning("summary db fail 会话 %s 第%s段:%s", conversation_id, seq, exc)
+            return {"ok": False, "reason": "db_error"}
         elapsed = (time.monotonic() - started) * 1000
         logger.info(
             "summary done 会话 %s 第%s段 %s token,覆盖 msg %s~%s,耗时 %.0fms",

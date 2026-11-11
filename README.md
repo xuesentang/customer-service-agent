@@ -71,26 +71,43 @@
 ```bash
 # 1. 依赖
 pip install -r requirements.txt
-pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 # 2. 配置
 cp .env.example .env          # 填 LLM_API_KEY
 
-# 3. 数据库（Docker MySQL 8.4，主机端口 3307）
+# 3. 模型权重（约 4.5G，不入库）
+pip install -U huggingface_hub
+huggingface-cli download BAAI/bge-m3 --local-dir models/bge-m3
+huggingface-cli download BAAI/bge-reranker-v2-m3 --local-dir models/bge-reranker-v2-m3
+
+# 4. 数据库（Docker MySQL 8.4，主机端口 3307）
 docker compose up -d
 python scripts/apply_schema.py
 python scripts/seed_faq.py
 
-# 4. 知识库（需先下载 BGE-M3 权重到 models/bge-m3/）
+# 5. 知识库（切片 + 嵌入，需要上一步的 bge-m3）
 python scripts/seed_knowledge.py
 python scripts/build_knowledge.py
 
-# 5. 起服务
+# 6. 起服务
 python -m uvicorn app.main:app --port 8000
 # 打开 http://127.0.0.1:8000/
 ```
 
 向量库默认用 Milvus Lite 本地文件（`./data/milvus_lite.db`），零 Docker 依赖；切服务端只改 `VECTOR_STORE_URI`。
+
+主题分类器（409MB，17 类多标签）同样不入库：用 `scripts/train_topic_model.py` 训练、`scripts/export_topic_onnx.py` 导出到 `models/topic_classifier/`，或从 `scripts/fetch_topic_model.py` 指定的实验目录搬运（会校验哈希）。
+
+### 零依赖演示（SQLite + Milvus Lite，不起 Docker）
+
+```bash
+python scripts/demo_smoke.py --rebuild    # 重建 data/demo.db + 演示向量库，并跑 8 条冒烟探针
+DATABASE_URL=sqlite+aiosqlite:///./data/demo.db \
+VECTOR_STORE_URI=./data/demo_milvus.db \
+python -m uvicorn app.main:app --port 8000
+```
+
+冒烟脚本覆盖知识问答、查单、指代补全、投诉、闲聊、拒答、缺单号、写操作确认流八个出口，全绿才算环境就绪。
 
 ---
 

@@ -215,13 +215,16 @@ async def test_rewrite_query_falls_back_when_model_fails():
     assert rq.canonical == "退货要几天"  # 理解层挂了,T+检索不能跟着挂
 
 
-def test_default_strategy_is_dense():
-    """四策略对照的结论要锁在代码里,不能只写在 dev-notes。
+def test_online_strategy_comes_from_config():
+    """线上策略只有一个开关:RAG_STRATEGY。代码里不再留第二份默认值。
 
-    357 块库上 dense 的 R@5 0.81 / MRR 0.709;hybrid R@5 高 0.03 但 MRR 低 0.155;
-    hybrid_rerank 把 MRR 救到 0.664、代价是 R@10 从 0.94 掉到 0.90 + 2.27G 权重。
-    有人把默认改回 hybrid_rerank 时这条会红。
+    四策略在 357 块库上的对照见 reports/ch04_eval_v2.md(hybrid R@5 0.84 >
+    dense 0.81,hybrid_rerank 把 hybrid 的 MRR 从 0.554 拉回 0.664)。
+    有人把配置项删了、或让 retrieve 忽略配置时,这条会红。
     """
-    from app.rag.retriever import DEFAULT_STRATEGY
+    from app.config import Settings
+    from app.rag.retriever import DEFAULT_STRATEGY, _strategy
 
-    assert DEFAULT_STRATEGY == "dense"
+    assert Settings().rag_strategy == "hybrid_rerank"
+    assert DEFAULT_STRATEGY == "hybrid_rerank"
+    assert _strategy() == "hybrid_rerank"

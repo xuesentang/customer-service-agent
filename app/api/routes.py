@@ -282,7 +282,11 @@ async def create_ticket_from_action(
                 # type 不能省:执行引擎按 ToolCall 协议拆 args,少了这个键会把整个
                 # 字典当成参数去校验(报「description 缺失」,看着像参数没传)
                 "type": "tool_call",
-            }
+            },
+            # 确认发生在前端:用户点了「建工单」按钮才发这个请求,表单提交本身就是
+            # 确认动作。这里显式传 True 而不是靠执行引擎的默认值——默认值是关的,
+            # 漏传就该被拒,不能靠「忘了传」放行。
+            confirmed=True,
         )
     finally:
         current_conversation_id.reset(token)
@@ -333,7 +337,9 @@ async def apply_refund(
                 "args": {"description": description, "ticket_type": "售后"},
                 "id": f"refund-{uuid.uuid4().hex[:8]}",
                 "type": "tool_call",
-            }
+            },
+            # 同 create-ticket:退款表单的提交按钮就是确认动作,显式声明。
+            confirmed=True,
         )
     finally:
         current_conversation_id.reset(token)

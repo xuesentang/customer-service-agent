@@ -19,7 +19,11 @@ from app.repositories import eval_run_repo
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_STRATEGY = "hybrid_rerank"
+# 默认跟随在线配置:定时评估量的是用户实际拿到的检索,不是另一条链路
+def _default_strategy() -> str:
+    from app.config import get_settings
+
+    return get_settings().rag_strategy
 
 
 async def run_round(
@@ -27,7 +31,7 @@ async def run_round(
     *,
     cases_path,
     retriever=None,
-    strategy: str = DEFAULT_STRATEGY,
+    strategy: str | None = None,
     triggered_by: str = "手动",
     top_k: int = 10,
     limit: int | None = None,
@@ -40,6 +44,7 @@ async def run_round(
     """
     from app.rag.retriever import retrieve
 
+    strategy = strategy or _default_strategy()
     cases = [c for c in load_cases(cases_path) if c.get("answerable")]
     if limit:
         cases = cases[:limit]

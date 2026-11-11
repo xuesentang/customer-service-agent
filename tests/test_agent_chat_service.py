@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from sqlalchemy import select
+
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.tools import tool
 
 from app.agent import graph as graph_module
 from app.agent.graph import AgentDeps
 from app.core.tools.registry import ToolRegistry
+from app.models.message import Message
 from app.repositories import low_confidence_repo, message_repo
 from app.services.agent_chat import chat_with_agent
 
@@ -187,6 +190,41 @@ async def test_graph_failure_yields_error_event(session, monkeypatch):
     events = await _run(session, deps)
     assert events[-1].event == "error"
     assert events[-1].data["code"] == "UPSTREAM_ERROR"
+    # token 可能已经推给前端:这一轮必须留痕,否则下一轮读历史凭空少一轮
+    rows = (await session.execute(select(Message).order_by(Message.id))).scalars().all()
+    assert [r.role for r in rows] == ["user", "assistant"]
+    assert "中断" in rows[-1].content
+
+
+async def test_persist_turn_rolls_back_as_a_whole(session, monkeypatch):
+    """一轮落库是一个事务:第 2 条写失败,第 1 条也不能留下。
+
+    逐条 commit 的写法会留下「有 user 没 assistant」或「tool_calls 不配对」的
+    半截历史,而脏数据不会自愈——下一轮回灌 LLM 就按错历史推上下文。
+    """
+    from app.repositories import conversation_repo
+    from app.services import agent_chat as service
+
+    conv = await conversation_repo.get_or_create(session, None, "s-tx")
+    conv_id = conv.id  # rollback 会让 ORM 对象过期,先取出来
+    real = message_repo.add_message
+    calls = {"n": 0}
+
+    async def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("database is locked")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(service.message_repo, "add_message", flaky)
+    err = await service._persist_turn(
+        session, conv_id, "订单1001到哪了", {"reply": "已发货", "finish_reason": "stop"}
+    )
+
+    assert err is not None  # 脱敏后的错误文本
+    assert calls["n"] == 2
+    rows = await message_repo.list_by_conversation(session, conv_id)
+    assert rows == [], "第 2 条失败时第 1 条必须一起回滚"
 
 
 async def test_second_turn_does_not_inherit_previous_turn_state(session, monkeypatch):

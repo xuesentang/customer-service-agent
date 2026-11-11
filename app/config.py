@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-m3"
     # CH04: 检索增强 — 重排模型 + 生成前的证据自评开关。
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    # 在线检索策略(dense / bm25 / hybrid / hybrid_rerank)。四策略都能切,
+    # 但线上只该跑一种:评估口径跟着它走,否则趋势图的数字和用户看到的不是同一条链路。
+    # 默认 hybrid_rerank:两路召回 RRF 融合后再精排,是检索指标最好的一档
+    # (见 reports/ch04_eval_v2.md:hybrid R@5 0.84 高于 dense 0.81)。
+    # 代价是重排模型常驻约 2.2G 内存、单次检索多几百毫秒,内存紧的开发机可
+    # 用 RAG_STRATEGY=dense 切回纯向量。
+    rag_strategy: str = "hybrid_rerank"
     # 检索证据自评(生成前闸门):关掉就只按「零命中」拒答
     evidence_selfcheck_enabled: bool = True
     # 混合检索两路各召回多少条。语料涨到几百块后 50 等于扫 10%,

@@ -88,7 +88,10 @@ async def test_write_tool_never_retries():
     reg = ToolRegistry()
     reg.register(flaky_write, ToolMeta(name="flaky_write", read_only=False))
     executor = ToolExecutor(reg, transient_errors=(Flaky,))
-    result = await executor.execute({"name": "flaky_write", "args": {"name": "x"}, "id": "5"})
+    # 写操作默认拒(权限闸 fail-closed),这条测的是「重试」不是「权限」,显式确认
+    result = await executor.execute(
+        {"name": "flaky_write", "args": {"name": "x"}, "id": "5"}, confirmed=True
+    )
     assert result.ok is False
     assert result.retry_count == 0
     assert counter["calls"] == 1, "写操作只许调一次"

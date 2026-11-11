@@ -19,9 +19,16 @@ async def add_message(
     content: str | None = None,
     tool_calls: dict | list | None = None,
     tool_call_id: str | None = None,
+    *,
+    commit: bool = True,
 ) -> Message:
-    """落一条消息并提交。assistant 纯工具调用时 content=None、tool_calls 有值;
-    tool 消息 content=结果摘要、tool_call_id 对号入座。"""
+    """落一条消息。assistant 纯工具调用时 content=None、tool_calls 有值;
+    tool 消息 content=结果摘要、tool_call_id 对号入座。
+
+    `commit=False` 只 flush 不提交:一轮对话是 user + N 条工具轨迹 + assistant,
+    必须整体成或整体败。逐条提交的话,第 k 条失败就留下半截历史——下一轮回灌
+    LLM 时会看到不配对的 tool_calls。多条一起写时由调用方统一 commit。
+    """
     msg = Message(
         conversation_id=conversation_id,
         role=role,
@@ -30,7 +37,10 @@ async def add_message(
         tool_call_id=tool_call_id,
     )
     session.add(msg)
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     await session.refresh(msg)
     return msg
 

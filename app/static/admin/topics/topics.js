@@ -1,5 +1,9 @@
 /* 主题分布页（CH10）。只读：所有数据来自 /api/v1/topics/*，
-   页面上没有任何「跑归类」的按钮——那是脚本/定时任务的事。 */
+   页面上没有任何「跑归类」的按钮——那是脚本/定时任务的事。
+
+   渲染约定同审核页：库里的文本一律用 textContent 塞进 DOM，不拼 HTML。
+   这里展示的是低置信度问题池里的用户原话，用户随手打的字里完全可能有
+   < 或引号——拼进 innerHTML 就是存储型 XSS。 */
 
 const API = "/api/v1/topics";
 const state = { activeLabel: null };
@@ -70,45 +74,75 @@ function renderBadge(model) {
 function renderBars(labels) {
   const box = el("bars");
   const max = Math.max(1, ...labels.map((item) => item.count));
-  box.innerHTML = labels
-    .map((item) => {
-      const width = Math.round((item.count / max) * 100);
-      const active = state.activeLabel === item.label ? " active" : "";
-      return `<div class="bar-row${active}" data-label="${item.label}">
-        <span class="label">${item.label}</span>
-        <span class="track"><span class="fill" style="width:${width}%"></span></span>
-        <span class="num">${item.count} <small>${item.share}%</small></span>
-      </div>`;
-    })
-    .join("");
+  box.replaceChildren();
+  labels.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "bar-row" + (state.activeLabel === item.label ? " active" : "");
+    row.dataset.label = item.label; // 属性赋值，不经过字符串拼接
 
-  box.querySelectorAll(".bar-row").forEach((row) => {
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = item.label;
+
+    const track = document.createElement("span");
+    track.className = "track";
+    const fill = document.createElement("span");
+    fill.className = "fill";
+    fill.style.width = `${Math.round((item.count / max) * 100)}%`;
+    track.append(fill);
+
+    const num = document.createElement("span");
+    num.className = "num";
+    const small = document.createElement("small");
+    small.textContent = `${item.share}%`;
+    num.append(`${item.count} `, small);
+
+    row.append(label, track, num);
     row.addEventListener("click", () => {
-      const label = row.dataset.label;
-      state.activeLabel = state.activeLabel === label ? null : label;
+      state.activeLabel = state.activeLabel === item.label ? null : item.label;
       refreshList();
       renderBars(labels);
     });
+    box.append(row);
   });
 }
 
 function renderRows(items) {
   const tbody = el("list").querySelector("tbody");
   if (!items.length) {
-    tbody.innerHTML = `<tr><td class="empty" colspan="3">没有记录</td></tr>`;
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.className = "empty";
+    td.colSpan = 3;
+    td.textContent = "没有记录";
+    tr.append(td);
+    tbody.replaceChildren(tr);
     return;
   }
-  tbody.innerHTML = items
-    .map(
-      (item) => `<tr>
-        <td>${item.text}</td>
-        <td class="labels">${(item.labels || [])
-          .map((label) => `<span class="tag">${label}</span>`)
-          .join("")}</td>
-        <td class="time">${fmtTime(item.classified_at)}</td>
-      </tr>`
-    )
-    .join("");
+  tbody.replaceChildren(
+    ...items.map((item) => {
+      const tr = document.createElement("tr");
+
+      const text = document.createElement("td");
+      text.textContent = item.text; // 用户原话：永远是文本，不是 HTML
+
+      const labels = document.createElement("td");
+      labels.className = "labels";
+      (item.labels || []).forEach((label) => {
+        const tag = document.createElement("span");
+        tag.className = "tag";
+        tag.textContent = label;
+        labels.append(tag);
+      });
+
+      const time = document.createElement("td");
+      time.className = "time";
+      time.textContent = fmtTime(item.classified_at);
+
+      tr.append(text, labels, time);
+      return tr;
+    })
+  );
 }
 
 async function refreshList() {

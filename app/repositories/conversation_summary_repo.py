@@ -38,7 +38,9 @@ async def add_summary(
     from_msg_id: int,
     to_msg_id: int,
     tokens: int = 0,
+    commit: bool = True,
 ) -> ConversationSummary:
+    """落一段摘要。`commit=False` 用于与锚点推进同事务提交(见 run_summary)。"""
     row = ConversationSummary(
         conversation_id=conversation_id,
         seq=seq,
@@ -48,7 +50,10 @@ async def add_summary(
         tokens=tokens,
     )
     session.add(row)
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     await session.refresh(row)
     return row
 
@@ -59,11 +64,19 @@ async def advance_anchors(
     *,
     summary_upto_msg_id: int,
     layer1_from_msg_id: int,
+    commit: bool = True,
 ) -> Conversation:
-    """同时推进两个锚点。摘要覆盖到哪,层 1 就从那条之后起——两者永远同步。"""
+    """同时推进两个锚点。摘要覆盖到哪,层 1 就从那条之后起——两者永远同步。
+
+    摘要行和锚点是同一件事的两半:只落摘要不推锚点,下一轮会把同一段再压一次,
+    历史里就多一段重复梗概。所以两者必须一个事务,`commit=False` 交给调用方收口。
+    """
     conversation.summary_upto_msg_id = summary_upto_msg_id
     conversation.layer1_from_msg_id = layer1_from_msg_id
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     await session.refresh(conversation)
     return conversation
 

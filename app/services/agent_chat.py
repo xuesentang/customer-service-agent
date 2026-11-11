@@ -254,8 +254,11 @@ def build_default_deps(session_factory) -> AgentDeps:
     )
 
 
-async def _persist_trail(session: AsyncSession, conversation_id: int, trail: list) -> str | None:
-    """把 Agent 的工具轨迹按协议落库:assistant(tool_calls) + tool 逐条对号。"""
+async def _persist_trail(session: AsyncSession, conversation_id: int, trail: list, *, commit: bool = False) -> str | None:
+    """把 Agent 的工具轨迹按协议落库:assistant(tool_calls) + tool 逐条对号。
+
+    默认不提交:轨迹要与同一轮的 user/assistant 消息一起提交,由 _persist_turn 收口。
+    """
     for msg in trail:
         if isinstance(msg, AIMessage) and msg.tool_calls:
             await message_repo.add_message(
@@ -267,6 +270,7 @@ async def _persist_trail(session: AsyncSession, conversation_id: int, trail: lis
                     {"name": tc["name"], "args": tc.get("args") or {}, "id": tc["id"], "type": "tool_call"}
                     for tc in msg.tool_calls
                 ],
+                commit=commit,
             )
         else:
             await message_repo.add_message(
@@ -275,6 +279,7 @@ async def _persist_trail(session: AsyncSession, conversation_id: int, trail: lis
                 role="tool",
                 content=str(msg.content or "")[:MAX_TOOL_CONTENT_LENGTH],
                 tool_call_id=getattr(msg, "tool_call_id", None),
+                commit=commit,
             )
     return None
 
@@ -395,6 +400,10 @@ async def chat_with_agent(
                         tracing.mark_abstain(chat_span)
                 except Exception as exc:
                     logger.exception("agent graph failed")
+                    # token 可能已经推给前端了:这一轮必须留下痕迹,不能凭空消失
+                    err = await _persist_interrupted(session, conv.id, message)
+                    if err:
+                        logger.warning("中断轮落库失败:%s", err)
                     yield _sse("error", {"code": "UPSTREAM_ERROR", "message": _sanitize(str(exc))})
                     return
 
@@ -471,35 +480,72 @@ async def chat_with_agent(
 async def _persist_turn(session: AsyncSession, conversation_id: int, message: str, state: dict) -> str | None:
     """user → 工具轨迹 → 终答,顺序与协议一致;DB 异常转成脱敏文本返回,不抛。
 
+    一轮 = 一个事务:全部 flush 完再 commit,任何一步失败整体 rollback。
+    拆成 N 次提交的写法会留下半截历史(可能带不配对的 tool_calls),而脏数据
+    不会自愈——下一轮回灌 LLM 时就按这份错历史推上下文。
+
     resume(用户点了确认/取消之后接着跑)传空的 message:这一轮的 user 消息在
     发问那次就落过了,再落一条会让历史里出现两句一样的话。
     """
     try:
         if message:
-            await message_repo.add_message(session, conversation_id, role="user", content=message)
+            await message_repo.add_message(
+                session, conversation_id, role="user", content=message, commit=False
+            )
         trail = state.get("trail") or []
         if trail:
             await _persist_trail(session, conversation_id, trail)
         reply = state.get("reply") or ""
         if reply:
-            await message_repo.add_message(session, conversation_id, role="assistant", content=reply)
-        if state.get("finish_reason") == "abstain":
-            reason = state.get("gate_reason") or ""
-            source = "retrieval_low_conf" if reason in (REASON_NO_HITS, REASON_SCORE_LOW, REASON_CONFIDENCE_LOW) else "self_check"
-            detail = state.get("gate_detail") or ""
-            try:
-                # CH09：入池统一走 flywheel.enqueue，并把当轮召回片段一起带上——
-                # 审核人靠快照判断「知识库真缺」还是「有但没检到」
-                await flywheel.enqueue(
-                    session,
-                    raw_question=state.get("resolved_query") or message,
-                    source=source,
-                    reason=(f"{reason}: {detail}"[:255] if detail else reason or None),
-                    conversation_id=conversation_id,
-                    snapshot=flywheel.sanitize_snapshot(state.get("citations") or []),
-                )
-            except Exception as exc:  # noqa: BLE001 - 入池失败不影响答复
-                logger.warning("低置信度问题入池失败:%s", exc)
+            await message_repo.add_message(
+                session, conversation_id, role="assistant", content=reply, commit=False
+            )
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        return _sanitize(str(exc))
+
+    # 入池是旁路:放在本轮事务之后,失败只记日志,不能把已经答完的一轮回滚掉
+    if state.get("finish_reason") == "abstain":
+        reason = state.get("gate_reason") or ""
+        source = "retrieval_low_conf" if reason in (REASON_NO_HITS, REASON_SCORE_LOW, REASON_CONFIDENCE_LOW) else "self_check"
+        detail = state.get("gate_detail") or ""
+        try:
+            # CH09：入池统一走 flywheel.enqueue，并把当轮召回片段一起带上——
+            # 审核人靠快照判断「知识库真缺」还是「有但没检到」
+            await flywheel.enqueue(
+                session,
+                raw_question=state.get("resolved_query") or message,
+                source=source,
+                reason=(f"{reason}: {detail}"[:255] if detail else reason or None),
+                conversation_id=conversation_id,
+                snapshot=flywheel.sanitize_snapshot(state.get("citations") or []),
+            )
+        except Exception as exc:  # noqa: BLE001 - 入池失败不影响答复
+            logger.warning("低置信度问题入池失败:%s", exc)
+    return None
+
+
+INTERRUPTED_REPLY = "（本轮回复因上游异常中断，没有给出完整答复，请重新提问）"
+
+
+async def _persist_interrupted(session: AsyncSession, conversation_id: int, message: str) -> str | None:
+    """图跑到一半抛异常时,把这一轮按「已发生但中断」落库。
+
+    流的 token 已经推给前端了,用户看到过半截回答——这时库里如果什么都不落,
+    下一轮读历史就会缺这一轮,用户说「刚才那个」系统完全接不上。
+    落一条明确的占位而不是空:回灌 LLM 时它知道这轮没答成,不会当成正常上下文。
+    """
+    try:
+        if message:
+            await message_repo.add_message(
+                session, conversation_id, role="user", content=message, commit=False
+            )
+        await message_repo.add_message(
+            session, conversation_id, role="assistant", content=INTERRUPTED_REPLY, commit=False
+        )
+        await session.commit()
         return None
     except Exception as exc:
+        await session.rollback()
         return _sanitize(str(exc))

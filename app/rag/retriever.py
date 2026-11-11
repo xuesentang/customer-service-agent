@@ -6,10 +6,11 @@
 - hybrid       两路各 Top-50 → hybrid_search 配 RRF 融合;
 - hybrid_rerank 混合粗排 Top-20 → bge-reranker-v2-m3 精排 → Top-K。
 
-**默认走 dense**(2026-10-20 四策略对照的结论,见 dev-notes/ch04.md「定策略」):
-357 块库上 dense 的 R@5 0.81 / R@10 0.94 / MRR 0.709,hybrid 虽然 R@5 高 0.03
-但 MRR 低 0.155,hybrid_rerank 把 MRR 救回 0.664 却把 R@10 压到 0.90,还要多付
-2.27G 权重与 CPU 精排。三条都保留可切换,别再默认挂重排。
+**在线策略由配置决定**(`RAG_STRATEGY`,默认 hybrid_rerank):357 块库上的四策略
+对照见 reports/ch04_eval_v2.md —— dense R@5 0.81 / MRR 0.709,hybrid R@5 0.84 /
+MRR 0.554,hybrid_rerank 把 MRR 拉回 0.664 但比 dense 仍低 0.045,代价是
++2.2G 权重与 CPU 精排。**召回优先选 hybrid_rerank,内存紧就切 dense**:
+两档都能跑,但线上只能是一种,评估口径跟着配置走才可比。
 
 理解层在检索侧:口语问法先归一(canonical)喂向量与关键词,同义词只扩进 BM25 查询,
 入库侧一个字不改(见 query_rewrite 的模块注释)。
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 _SAFE_CATEGORY = re.compile(r"^[\w\u4e00-\u9fff][\w\u4e00-\u9fff ·/、-]*$")
 
 STRATEGIES = ("dense", "bm25", "hybrid", "hybrid_rerank")
-DEFAULT_STRATEGY = "dense"
+DEFAULT_STRATEGY = "hybrid_rerank"  # 与 Settings.rag_strategy 的缺省值同义
 DEFAULT_TOP_K = 10
 RERANK_POOL = 20  # 进重排的粗排候选数(ch04:精排出 Top-10)
 
@@ -75,13 +76,18 @@ async def retrieve(
     session_factory,
     query: str,
     top_k: int = DEFAULT_TOP_K,
-    strategy: str = DEFAULT_STRATEGY,
+    strategy: str | None = None,
     category: str | None = None,
     retriever: Retriever | None = None,
     rewrite: bool = True,
     rewrite_model=None,
 ) -> list[Hit]:
-    """检索主链路。返回按相关度降序的 Hit 列表;空集合/无命中返回 []。"""
+    """检索主链路。返回按相关度降序的 Hit 列表;空集合/无命中返回 []。
+
+    `strategy` 留空走配置(RAG_STRATEGY):在线链路不传,评估显式传,两条路
+    用同一份实现但各说各的口径——评估结果才能对上用户实际拿到的检索。
+    """
+    strategy = strategy or _strategy()
     if strategy not in STRATEGIES:
         raise ValueError(f"未知检索策略:{strategy}")
     retriever = retriever or get_default_retriever()
@@ -116,6 +122,13 @@ async def retrieve(
     reranked = [Hit(chunk=h.chunk, score=float(s)) for h, s in zip(hits, scores)]
     reranked.sort(key=lambda h: h.score, reverse=True)
     return reranked[:top_k]
+
+
+def _strategy() -> str:
+    """在线策略:配置是唯一开关,不在代码里再写一份默认值。"""
+    from app.config import get_settings
+
+    return get_settings().rag_strategy or DEFAULT_STRATEGY
 
 
 def _route_limit() -> int:
@@ -188,7 +201,8 @@ def warmup() -> None:
     retriever = get_default_retriever()
     retriever.store.ensure_collection()
     retriever.embedder.embed_texts(["预热"])
-    if retriever.reranker is not None:
+    # 只有精排档才预热重排模型:切到 dense/hybrid 时白加载 2.2G 权重没有意义
+    if _strategy() == "hybrid_rerank" and retriever.reranker is not None:
         retriever.reranker.rerank("预热", ["预热文本"])
 
 
