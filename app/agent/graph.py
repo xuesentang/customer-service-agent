@@ -317,8 +317,9 @@ def build_agent_graph(deps: AgentDeps):
             session_factory=deps.session_factory,
             retriever=deps.retriever,
             expand_model=deps.expand_model,
-            check_model=deps.check_model,
-            min_score=deps.kb_min_score,
+            # 不传 min_score:退款路用自己的门槛(settings.refund_gate_min_score),
+            # 两路的分数分布不同,共用 kb_min_score 会让退款请求全被判成证据不足。
+            # 也不传 check_model:退款路不走自评(见 prepare_refund 文档)。
         )
         _emit_node("refund_subflow", "exit")
 

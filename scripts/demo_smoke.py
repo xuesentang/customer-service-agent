@@ -34,15 +34,31 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-# 必须在 import app.* 之前进环境(settings 带 lru_cache)。演示库与 .env 里的
-# 开发库(MySQL/ch07)完全隔离:冒烟用 SQLite + Milvus Lite 文件库,不依赖 Docker。
+# 必须在 import app.* 之前进环境(settings 带 lru_cache)。默认用演示库(SQLite +
+# Milvus Lite 文件库,不依赖 Docker);想验开发台那套(986 块)用 --database-url /
+# --vector-store-uri 指过去,但那种目标不允许 --rebuild。
 DEMO_DB_URL = "sqlite+aiosqlite:///./data/demo.db"
 DEMO_VECTOR_URI = "./data/demo_milvus.db"
 DEMO_DB_FILE = REPO_ROOT / "data" / "demo.db"
 DEMO_VECTOR_FILE = REPO_ROOT / "data" / "demo_milvus.db"
 
-os.environ["DATABASE_URL"] = DEMO_DB_URL
-os.environ["VECTOR_STORE_URI"] = DEMO_VECTOR_URI
+
+def _sqlite_file(url: str) -> Path:
+    """从 sqlite+aiosqlite:///./data/x.db 里取出文件路径。"""
+    tail = url.split("///", 1)[-1]
+    return Path(tail) if Path(tail).is_absolute() else REPO_ROOT / tail.lstrip("./")
+
+
+def _apply_targets(db_url: str, vector_uri: str) -> None:
+    global DEMO_DB_URL, DEMO_VECTOR_URI, DEMO_DB_FILE, DEMO_VECTOR_FILE
+    DEMO_DB_URL, DEMO_VECTOR_URI = db_url, vector_uri
+    DEMO_DB_FILE = _sqlite_file(db_url)
+    DEMO_VECTOR_FILE = _sqlite_file(vector_uri)
+    os.environ["DATABASE_URL"] = db_url
+    os.environ["VECTOR_STORE_URI"] = vector_uri
+
+
+_apply_targets(DEMO_DB_URL, DEMO_VECTOR_URI)
 os.environ["LANGFUSE_ENABLED"] = "false"  # 冒烟不验观测;开着会往真实 Cloud 发测试 trace
 os.environ["MCP_ENABLED"] = "false"  # MCP 要另起两个 Server,不进主链路冒烟
 
@@ -387,7 +403,7 @@ async def probe_06_abstain(client, port: int) -> ProbeResult:
     """拒答:库里没有的知识点,闸必须在生成前拦下。"""
     p = Probe("P6 拒答(闸拦截)")
     t0 = time.monotonic()
-    turn = await run_turn(client, port, "smoke-3", "W60 用的碳板是第几代", new_conversation=True)
+    turn = await run_turn(client, port, "smoke-3", "你们卖宠物驱虫药吗", new_conversation=True)
     gate, done = turn.last("gate"), turn.last("done")
     p.check(bool(turn.of("gate")), "出现过 gate 事件")
     p.check(gate.get("passed") is False, f"闸拦下(top_score={gate.get('top_score')})")
@@ -555,8 +571,27 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="演示日冒烟:8 条探针验证现在能不能演")
     parser.add_argument("--rebuild", action="store_true", help="先重建干净演示库再跑")
     parser.add_argument("--port", type=int, default=18099)
+    parser.add_argument(
+        "--database-url",
+        default=DEMO_DB_URL,
+        help="要验的库;默认演示库,可指向开发台(data/ch07.db)",
+    )
+    parser.add_argument(
+        "--vector-store-uri",
+        default=DEMO_VECTOR_URI,
+        help="配套的向量库;必须与 --database-url 里 knowledge_chunks 对应同一套语料",
+    )
     args = parser.parse_args()
 
+    is_demo_target = (
+        args.database_url == "sqlite+aiosqlite:///./data/demo.db"
+        and args.vector_store_uri == "./data/demo_milvus.db"
+    )
+    if args.rebuild and not is_demo_target:
+        print("[smoke] --rebuild 只允许对演示库执行:换目标重跑会删掉那套库和数据", flush=True)
+        return 2
+
+    _apply_targets(args.database_url, args.vector_store_uri)
     if args.rebuild:
         rebuild_demo_db()
     return asyncio.run(amain(args.port))

@@ -94,20 +94,29 @@ python -m uvicorn app.main:app --port 8000
 # 打开 http://127.0.0.1:8000/
 ```
 
-向量库默认用 Milvus Lite 本地文件（`./data/milvus_lite.db`），零 Docker 依赖；切服务端只改 `VECTOR_STORE_URI`。
+向量库默认用 Milvus Lite 本地文件（`./data/ch07_milvus.db`，与 `ch07.db` 里 986 块语料配套；`data/milvus_lite.db` 是早期遗留的坏文件，别指过去），零 Docker 依赖；切服务端只改 `VECTOR_STORE_URI`。
 
 主题分类器（409MB，17 类多标签）同样不入库：用 `scripts/train_topic_model.py` 训练、`scripts/export_topic_onnx.py` 导出到 `models/topic_classifier/`，或从 `scripts/fetch_topic_model.py` 指定的实验目录搬运（会校验哈希）。
 
 ### 零依赖演示（SQLite + Milvus Lite，不起 Docker）
 
 ```bash
-python scripts/demo_smoke.py --rebuild    # 重建 data/demo.db + 演示向量库，并跑 8 条冒烟探针
-DATABASE_URL=sqlite+aiosqlite:///./data/demo.db \
-VECTOR_STORE_URI=./data/demo_milvus.db \
+# 演示主库：986 块知识库 + 演示用池子数据（.env 里写的是 MySQL，要显式覆盖）
+DATABASE_URL=sqlite+aiosqlite:///./data/ch07.db \
+VECTOR_STORE_URI=./data/ch07_milvus.db \
 python -m uvicorn app.main:app --port 8000
 ```
 
-冒烟脚本覆盖知识问答、查单、指代补全、投诉、闲聊、拒答、缺单号、写操作确认流八个出口，全绿才算环境就绪。
+三种验证各管一段，别混用：
+
+| 命令 | 验什么 | 会不会改库 |
+|---|---|---|
+| `python scripts/demo_smoke.py --rebuild` | 八个出口还在不在（重建 `demo.db` + 8 条探针） | 只动 `demo.db`/`demo_milvus.db` |
+| `python scripts/demo_rehearsal.py` | 演示脚本那 12 幕顺不顺、各花多久（打 `ch07.db`） | 会（含飞轮入池 → 通过 → 写库） |
+| `python scripts/demo_rehearsal.py --only C2,C3` | 只验某一幕 | 视幕而定 |
+
+逐条演示清单（输入什么、屏幕上看到什么、讲什么、失败了换哪句）见
+[`docs/演示脚本.md`](docs/演示脚本.md)，耗时来自 `reports/demo_rehearsal.md`。
 
 ---
 

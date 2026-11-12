@@ -1,7 +1,11 @@
-"""退款子流程的多路检索:合并成一个池只精排一次。
+"""退款子流程的多路检索:粗排按路走,精排按「这块由哪一路召回」打分,多路取最高。
 
-背景:三路扩写查询若各排各的,同一批候选要被 cross-encoder 打分三遍。
-CPU 上精排是最贵的一步,三倍延迟换不来任何召回增量——候选池并没有变大。
+背景:退款场景的用户原话里带订单号和具体商品(「订单1003的大容量双肩通勤包能退吗」)。
+若合并后统一拿原话精排,通用条款(七日无理由退货)会被判成弱相关,分数压到 0.1 量级,
+置信度闸据此拒答——可库里明明有条款。改按来源查询打分后,召回它的那一问才是相关的那一问。
+
+代价控制:每路只排自己召回的 6 条,总打分对数 = 各路条数之和(3×6=18),
+不比「合并池按原话排一遍(20 条)」更贵。
 """
 
 from __future__ import annotations
@@ -22,14 +26,21 @@ class _Chunk:
 
 
 class _Reranker:
+    """按查询给不同基础分,方便断言「多路取最高」。"""
+
+    BASE = {"a": 0.2, "b": 0.4, "c": 0.6}
+
     def __init__(self):
         self.calls = 0
         self.scored = 0
+        self.batches: list[list[int]] = []
 
     def rerank(self, query: str, docs: list[str]) -> list[float]:
         self.calls += 1
         self.scored += len(docs)
-        return [0.5 + i / 100 for i in range(len(docs))]
+        self.batches.append(list(range(len(docs))))
+        base = self.BASE.get(query, 0.0)
+        return [base + i / 100 for i in range(len(docs))]
 
 
 class _Retriever:
@@ -48,16 +59,18 @@ def rerank_mode(monkeypatch):
     get_settings.cache_clear()
 
 
-async def test_coarse_per_query_then_single_rerank(monkeypatch, rerank_mode):
+async def test_rerank_by_source_query_and_take_max(monkeypatch, rerank_mode):
     seen: list[tuple[str, str]] = []
+    # 三路各自召回两条,块 2 / 3 被两路共享
+    by_query = {
+        "a": [(1, 0.9), (2, 0.8)],
+        "b": [(2, 0.75), (3, 0.7)],
+        "c": [(3, 0.65), (4, 0.6)],
+    }
 
     async def fake_retrieve(**kwargs):
         seen.append((kwargs["query"], kwargs["strategy"]))
-        base = {"a": 0.9, "b": 0.8, "c": 0.7}[kwargs["query"]]
-        return [
-            Hit(chunk=_Chunk(1, "退货政策 第七条"), score=base),
-            Hit(chunk=_Chunk(2, "运费承担规则"), score=base - 0.1),
-        ]
+        return [Hit(chunk=_Chunk(cid, f"文本{cid}"), score=s) for cid, s in by_query[kwargs["query"]]]
 
     monkeypatch.setattr(refund_flow, "retrieve", fake_retrieve)
     retriever = _Retriever()
@@ -67,8 +80,16 @@ async def test_coarse_per_query_then_single_rerank(monkeypatch, rerank_mode):
     )
 
     assert [s for _, s in seen] == ["hybrid"] * 3, "每路应当只做混合粗排,不各自精排"
-    assert retriever.reranker.calls == 1, "合并后的池只能精排一次"
-    assert len(hits) == 2 and len({h.chunk.id for h in hits}) == 2, "同一 chunk 多路命中要按 id 去重"
+    assert retriever.reranker.calls == 3, "按来源查询分三批打分"
+    assert retriever.reranker.scored == 6, "总打分对数 = 各路条数之和,不比合并池多"
+
+    by_id = {h.chunk.id: h.score for h in hits}
+    assert len(by_id) == 4, "同一 chunk 多路命中要按 id 去重"
+    # 块 1 只被 a 召回 → 0.2;块 2 被 a(0.21) / b(0.40) 召回 → 取高 0.40;
+    # 块 3 被 b(0.41) / c(0.60) 召回 → 0.60;块 4 只被 c 召回 → 0.61。
+    assert by_id[1] == pytest.approx(0.20)
+    assert by_id[2] == pytest.approx(0.40)
+    assert by_id[3] == pytest.approx(0.60)
 
 
 async def test_dense_mode_skips_rerank(monkeypatch):

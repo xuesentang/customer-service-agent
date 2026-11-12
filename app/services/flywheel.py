@@ -372,6 +372,11 @@ async def run_batch(
         if not rows:
             return stats
 
+        # 本轮新建的缺口。必须自己留着:候选池按出现次数排序取前 20,而新建行的
+        # 次数是 1,只要待审队列已经排满,它就会被挤出窗口——于是同一个问题在一次
+        # 批量里开出两条缺口(2026-11-12 彩排实测:三行一模一样的待审)。
+        created_here: list[ReviewQueue] = []
+
         for item in rows:
             stats["processed"] += 1
             stats["last_id"] = item.id
@@ -386,6 +391,9 @@ async def run_batch(
 
             # 每轮重新取候选：上一条刚新建的缺口，下一条就该能并进去
             candidates = await review_repo.list_for_dedupe(session)
+            if created_here:
+                seen = {c.id for c in candidates}
+                candidates = created_here + [c for c in candidates if c.id not in seen]
             plan = await dedupe(
                 session, norm.question, model=model, candidates=candidates, dry_run=dry_run
             )
@@ -402,6 +410,8 @@ async def run_batch(
 
             if plan["via"] == VIA_NEW:
                 stats["created"] += 1
+                if plan["review"] is not None:
+                    created_here.append(plan["review"])
             else:
                 await review_repo.bump(session, review.id)
                 stats["merged"] += 1

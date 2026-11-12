@@ -201,6 +201,31 @@ async def test_run_batch_merges_repeats_and_backfills_match(session, session_fac
 
 
 @pytest.mark.asyncio
+async def test_run_batch_dedupes_within_batch_when_queue_is_full(session, session_factory):
+    """待审队列排满候选窗口后，本轮刚新建的缺口仍要被下一条原话认出来。
+
+    候选池按出现次数排序取前 DEDUPE_CANDIDATES 条，新建行的次数是 1，天然排最后、
+    被截断。2026-11-12 彩排实测到的后果：同一句「你们卖宠物驱虫药吗」在一次批量里
+    开出三条一模一样的待审缺口。
+    """
+    for i in range(flywheel.DEDUPE_CANDIDATES):
+        row = await review_repo.create(session, normalized_question=f"占窗口的老问题 {i}")
+        row.occurrence_count = 5
+    await session.commit()
+
+    await _pool(session, "退款要几天到账", "退款要几天到账？")
+    stats = await flywheel.run_batch(session_factory, model=FakeModel())
+
+    assert stats["created"] == 1
+    assert stats["merged"] == 1
+    # 查全量待审（list_for_dedupe 只给前 20 条，新的这条本来就在窗口外）
+    pending = await review_repo.list_by_status(session, "待审", limit=200)
+    hits = [r for r in pending if r.normalized_question.startswith("退款要几天到账")]
+    assert len(hits) == 1
+    assert hits[0].occurrence_count == 2
+
+
+@pytest.mark.asyncio
 async def test_run_batch_dry_run_writes_nothing(session, session_factory):
     await _pool(session, "退货运费谁出", "发票怎么开")
     model = FakeModel()

@@ -124,11 +124,17 @@ async def check_gate(
     min_score: float,
     min_confidence: float | None = None,
     model=None,
+    use_self_check: bool = True,
 ) -> GateResult:
     """证据够不够把问题交给 Agent。判弱即拒答,后面的节点不再执行。
 
     `min_confidence` 为 None 时退化成 ch04 的老行为(只比 top1),给还没升级配置的
     调用方留一条路;图里始终传真值。
+
+    `use_self_check=False` 只留阈值、不调自评模型。给「答案的另一半不在证据里」的
+    链路用:退款子流程要拿订单事实(签收时间/商品/金额)配上政策条款才能判,而自评
+    模型只看得到「问句 + 条款」,永远回一句「未涉及该订单」——那是判据缺料,不是
+    证据不足,它的否决在这里没有意义。
     """
     if not citations:
         return GateResult(False, REASON_NO_HITS, "检索零命中")
@@ -151,6 +157,12 @@ async def check_gate(
             REASON_SCORE_LOW,
             f"top1={top:.4f} < 阈值 {min_score:.2f}",
             top_score=top,
+            confidence=signals.confidence,
+        )
+
+    if not use_self_check:
+        return GateResult(
+            True, "", "跳过自评(答案另有一半在工具事实里)", top_score=top,
             confidence=signals.confidence,
         )
 

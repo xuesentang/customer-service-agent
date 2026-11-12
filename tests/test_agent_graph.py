@@ -299,8 +299,15 @@ async def test_refund_with_order_id_pulls_order_and_policy(patch_retrieve):
     assert out["citations"]
 
 
-async def test_refund_is_blocked_when_policy_evidence_is_weak(patch_retrieve):
-    patch_retrieve["scores"] = (0.3,)
+async def test_refund_is_blocked_when_policy_evidence_is_weak(patch_retrieve, monkeypatch):
+    # 本用例只验「证据不够就拒答」,把策略钉在 dense:否则精排档会去加载 2G 重排模型,
+    # 单测耗时从秒级变分钟级,分数也不再是这里打桩的那个值。
+    from app.config import get_settings
+
+    monkeypatch.setenv("RAG_STRATEGY", "dense")
+    get_settings.cache_clear()
+    # 退款路自己的门槛是 0.10(退款问题混着订单号,精排分数整体偏低),0.05 才算「明显不够」
+    patch_retrieve["scores"] = (0.05,)
     deps, model, check = _deps(intent="售后")
     app = build_agent_graph(deps)
     out = await app.ainvoke(
@@ -308,7 +315,8 @@ async def test_refund_is_blocked_when_policy_evidence_is_weak(patch_retrieve):
         {"configurable": {"thread_id": "t1"}},
     )
     assert out["finish_reason"] == "abstain"
-    assert out["gate_reason"] == "score_low"
+    # 退款路用合成置信度卡(top1 只占 0.6 权重),所以原因码是 confidence_low 不是 score_low
+    assert out["gate_reason"] == "confidence_low"
     assert model.calls == 0
 
 
