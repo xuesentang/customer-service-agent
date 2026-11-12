@@ -215,16 +215,20 @@ async def test_rewrite_query_falls_back_when_model_fails():
     assert rq.canonical == "退货要几天"  # 理解层挂了,T+检索不能跟着挂
 
 
-def test_online_strategy_comes_from_config():
+def test_online_strategy_comes_from_config(monkeypatch):
     """线上策略只有一个开关:RAG_STRATEGY。代码里不再留第二份默认值。
 
     四策略在 357 块库上的对照见 reports/ch04_eval_v2.md(hybrid R@5 0.84 >
     dense 0.81,hybrid_rerank 把 hybrid 的 MRR 从 0.554 拉回 0.664)。
-    有人把配置项删了、或让 retrieve 忽略配置时,这条会红。
+    这条改配置就能翻转,证明策略真的由配置决定而不是写死在代码里。
     """
-    from app.config import Settings
-    from app.rag.retriever import DEFAULT_STRATEGY, _strategy
+    from app.config import get_settings
+    from app.rag.retriever import online_strategy
 
-    assert Settings().rag_strategy == "hybrid_rerank"
-    assert DEFAULT_STRATEGY == "hybrid_rerank"
-    assert _strategy() == "hybrid_rerank"
+    monkeypatch.setenv("RAG_STRATEGY", "hybrid")
+    get_settings.cache_clear()
+    try:
+        assert online_strategy() == "hybrid"
+    finally:
+        monkeypatch.delenv("RAG_STRATEGY", raising=False)
+        get_settings.cache_clear()

@@ -87,7 +87,7 @@ async def retrieve(
     `strategy` 留空走配置(RAG_STRATEGY):在线链路不传,评估显式传,两条路
     用同一份实现但各说各的口径——评估结果才能对上用户实际拿到的检索。
     """
-    strategy = strategy or _strategy()
+    strategy = strategy or online_strategy()
     if strategy not in STRATEGIES:
         raise ValueError(f"未知检索策略:{strategy}")
     retriever = retriever or get_default_retriever()
@@ -116,15 +116,25 @@ async def retrieve(
         vector, rewritten.bm25_query, pool, expr=expr, route_limit=_route_limit()
     )
     hits = await _hydrate(session_factory, raw)
+    return rerank_hits(rewritten.canonical, hits, retriever=retriever, top_k=top_k)
+
+
+def rerank_hits(query: str, hits: list[Hit], *, retriever: Retriever, top_k: int) -> list[Hit]:
+    """对一个候选池做一次精排再截断。
+
+    单独抽出来的原因是多路检索:三路查询若各排各的,等于把 M 条候选打分三遍;
+    合并成一个池只排一次,候选不减、耗时降到三分之一。精排用的是用户原话而不是
+    扩写出来的那几条,判据也就更贴用户真正问的那一句。
+    """
     if not hits or retriever.reranker is None:
         return hits[:top_k]
-    scores = retriever.reranker.rerank(rewritten.canonical, [_chunk_text(h) for h in hits])
+    scores = retriever.reranker.rerank(query, [_chunk_text(h) for h in hits])
     reranked = [Hit(chunk=h.chunk, score=float(s)) for h, s in zip(hits, scores)]
     reranked.sort(key=lambda h: h.score, reverse=True)
     return reranked[:top_k]
 
 
-def _strategy() -> str:
+def online_strategy() -> str:
     """在线策略:配置是唯一开关,不在代码里再写一份默认值。"""
     from app.config import get_settings
 
@@ -202,7 +212,7 @@ def warmup() -> None:
     retriever.store.ensure_collection()
     retriever.embedder.embed_texts(["预热"])
     # 只有精排档才预热重排模型:切到 dense/hybrid 时白加载 2.2G 权重没有意义
-    if _strategy() == "hybrid_rerank" and retriever.reranker is not None:
+    if online_strategy() == "hybrid_rerank" and retriever.reranker is not None:
         retriever.reranker.rerank("预热", ["预热文本"])
 
 

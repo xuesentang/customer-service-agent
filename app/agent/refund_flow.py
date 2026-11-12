@@ -21,7 +21,7 @@ from app.agent.query_understanding import expand_queries
 from app.core.tools.executor import ToolExecutor
 from app.core.tools.registry import ToolRegistry
 from app.rag.citations import Citation, build_citations
-from app.rag.retriever import retrieve
+from app.rag.retriever import online_strategy, retrieve
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +90,21 @@ async def multi_query_retrieve(
     retriever=None,
     top_k: int = POLICY_TOP_K,
     merged_top_k: int = MERGED_TOP_K,
+    question: str | None = None,
 ) -> list:
     """多路检索后按 chunk 去重、取各块最高分,再按分数截断。
 
     去重按 chunk id 而不是按文本:同一块被两条查询召回时,分数取高的那条——
     分数代表「最贴合的那一问有多贴合」,平均会把强命中摊薄。
+
+    精排只做一次:每路先只跑便宜的召回(向量 / 混合粗排),合并成一个池之后拿
+    **用户原话**排一遍。三路各排各的会把候选打分三遍,CPU 上就是三倍延迟,而
+    候选池并没有变大——这是精排最容易被忽略的一笔浪费。
     """
+    strategy = online_strategy()
+    # 精排档:各路只做混合粗排,把精排留给合并后的池(见下)
+    coarse = "hybrid" if strategy == "hybrid_rerank" else strategy
+
     best: dict[int, object] = {}
     for query in queries:
         try:
@@ -103,6 +112,7 @@ async def multi_query_retrieve(
                 session_factory=session_factory,
                 query=query,
                 top_k=top_k,
+                strategy=coarse,
                 retriever=retriever,
                 rewrite=False,  # 改写/扩写已在理解层做过,这里不再花一次模型调用
             )
@@ -113,8 +123,19 @@ async def multi_query_retrieve(
             cid = int(hit.chunk.id)
             if cid not in best or hit.score > best[cid].score:
                 best[cid] = hit
+
     merged = sorted(best.values(), key=lambda h: h.score, reverse=True)
-    return merged[:merged_top_k]
+    if strategy != "hybrid_rerank":
+        return merged[:merged_top_k]
+
+    # 合并池再精排一次,用用户原话问;池子按精排的常规深度截断
+    from app.rag.retriever import RERANK_POOL, get_default_retriever, rerank_hits
+
+    rerank_query = question or (queries[0] if queries else "")
+    pool = merged[: max(merged_top_k, RERANK_POOL)]
+    return rerank_hits(
+        rerank_query, pool, retriever=retriever or get_default_retriever(), top_k=merged_top_k
+    )
 
 
 async def prepare_refund(
@@ -136,7 +157,7 @@ async def prepare_refund(
     facts = await _order_facts(order_id, registry=registry, executor=executor)
     queries = await expand_queries(question, model=expand_model)
     hits = await multi_query_retrieve(
-        queries, session_factory=session_factory, retriever=retriever
+        queries, session_factory=session_factory, retriever=retriever, question=question
     )
     citations = build_citations(hits)
     gate = await check_gate(question, citations, min_score=min_score, model=check_model)
