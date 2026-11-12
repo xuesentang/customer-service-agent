@@ -22,13 +22,16 @@ upsert 语义:同主键重复写不报错、不产生重复行(建库重跑的�
 
 from __future__ import annotations
 
+import logging
 import math
 import re
+import time
 
 from app.rag.embeddings import DIMENSION
 
-COLLECTION_NAME = "knowledge"
+logger = logging.getLogger(__name__)
 
+COLLECTION_NAME = "knowledge"
 # 索引类型定死 FLAT(暴力精确检索),不用默认的 AUTOINDEX(HNSW 近似):
 # 1. 演示量级(几百块)暴力全扫比近似检索更准,构建开销可忽略;
 # 2. milvus-lite 的 FLAT 走 BruteForceIndex,索引持久化用 Python open()——
@@ -36,6 +39,10 @@ COLLECTION_NAME = "knowledge"
 #    ANSI API,UTF-8 编码的中文路径(D:\客服agent\...)直接 ENOENT,第二进程
 #    load_collection 必崩(实踩:跨进程重开 Lite 文件库复现)。
 INDEX_TYPE = "FLAT"
+
+# 集合处于 released 态时的重试次数(含首次共 4 次)。Lite 上 load 是异步生效的,
+# 只重试一次经常仍拿到 code=101,见 _run 的说明。
+_RELEASED_RETRIES = 3
 
 # 中文分词器:Milvus 服务端可配 chinese(lindera),但 milvus-lite 3.2.2 只编进了
 # standard / jieba(实测 chinese 报 unknown tokenizer type)。jieba 同为 Milvus
@@ -353,21 +360,30 @@ class MilvusStore:
         )
 
     def _run(self, call) -> list[tuple[int, float]]:
-        """统一异常口径 + released 态自动 load 重试一次。
+        """统一异常口径 + released 态自动 load 重试(最多 3 次,退避)。
 
-        跨进程场景:建库进程 upsert 后,应用进程里已持有的 store 再 search 会撞
-        「collection released」——先 load 再重试一次,不让一次状态不同步炸掉检索。
+        跨进程场景:建库进程 upsert 后,应用进程里的 store 再 search 会撞
+        「collection released」。`load_collection` 返回不等于加载完成——Lite 上实测
+        紧接着重试仍会拿到同一个错,所以退避几次再试。
+
+        为什么值得退避:检索抛错会被上层当成「这一路零命中」,多路检索时表现为
+        证据变少、置信度被压低,最后莫名拒答——查起来像模型问题,其实是库的状态。
         """
-        try:
-            res = call()
-        except Exception as first_exc:  # noqa: BLE001
-            if not _is_released_error(first_exc):
-                raise VectorStoreError(f"Milvus 检索失败:{first_exc}") from first_exc
+        attempt = 0
+        while True:
             try:
-                self._client.load_collection(COLLECTION_NAME)
                 res = call()
+                break
             except Exception as exc:  # noqa: BLE001
-                raise VectorStoreError(f"Milvus 检索失败:{exc}") from exc
+                if not _is_released_error(exc) or attempt >= _RELEASED_RETRIES:
+                    raise VectorStoreError(f"Milvus 检索失败:{exc}") from exc
+                attempt += 1
+                logger.warning("集合未加载,load 后重试(%d/%d)", attempt, _RELEASED_RETRIES)
+                try:
+                    self._client.load_collection(COLLECTION_NAME)
+                except Exception as load_exc:  # noqa: BLE001
+                    logger.warning("load_collection 失败:%s", load_exc)
+                time.sleep(0.2 * attempt)
         hits = res[0] if res else []
         return [(_extract_pk(hit), float(hit["distance"])) for hit in hits]
 
